@@ -36,7 +36,16 @@ use crate::{
 
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
+const DEFAULT_PARALLEL_ENCODE_BATCH_SIZE: usize = 1000;
+const PARALLEL_ENCODE_BATCH_CAPACITY_DIVISOR: usize = 10;
 //const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
+
+fn parallel_encode_batch_size(channel_capacity: usize) -> usize {
+    usize::max(
+        DEFAULT_PARALLEL_ENCODE_BATCH_SIZE,
+        channel_capacity / PARALLEL_ENCODE_BATCH_CAPACITY_DIVISOR,
+    )
+}
 
 /// A encoder for generating pack files with delta objects.
 pub struct PackEncoder {
@@ -397,6 +406,8 @@ impl PackEncoder {
             tags.len()
         );
 
+        let window_size = self.window_size;
+
         // parallel encoding vec with different object_type
         let (commit_results, tree_results, blob_results, tag_results) = tokio::try_join!(
             tokio::task::spawn_blocking(move || {
@@ -405,7 +416,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -415,7 +426,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -425,7 +436,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -434,7 +445,7 @@ impl PackEncoder {
                     tags.into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -613,7 +624,8 @@ impl PackEncoder {
         }
 
         let mut idx_entries = Vec::new();
-        let batch_size = usize::max(1000, entry_rx.max_capacity() / 10); // A temporary value, not optimized
+        let batch_size = parallel_encode_batch_size(entry_rx.max_capacity());
+        // A temporary value, not optimized
         tracing::info!("encode with batch size: {}", batch_size);
         loop {
             let mut batch_entries = Vec::with_capacity(batch_size);
@@ -746,7 +758,7 @@ impl PackEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::PathBuf, sync::Arc, time::Instant};
+    use std::{env, io::Cursor, path::PathBuf, sync::Arc, time::Instant};
 
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -756,12 +768,7 @@ mod tests {
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::{
             object::{blob::Blob, types::ObjectType},
-            pack::{
-                Pack,
-                test_pack_download::{PackFileGuard, download_pack_file},
-                tests::init_logger,
-                utils::read_offset_encoding,
-            },
+            pack::{Pack, tests::init_logger, utils::read_offset_encoding},
         },
         time_it,
     };
@@ -791,6 +798,36 @@ mod tests {
         tracing::debug!("start check format");
         p.decode(&mut reader, |_| {}, None::<fn(ObjectHash)>)
             .expect("pack file format error");
+    }
+
+    #[test]
+    fn test_parallel_encode_batch_size_uses_default_for_small_capacity() {
+        assert_eq!(
+            parallel_encode_batch_size(100),
+            DEFAULT_PARALLEL_ENCODE_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn test_parallel_encode_batch_size_scales_with_large_capacity() {
+        assert_eq!(
+            parallel_encode_batch_size(20_000),
+            20_000 / PARALLEL_ENCODE_BATCH_CAPACITY_DIVISOR
+        );
+    }
+
+    #[test]
+    fn test_try_as_offset_delta_window_size_zero_keeps_result_count() {
+        let entries: Vec<Entry> = vec![
+            Blob::from_content("hello world").into(),
+            Blob::from_content("hello world updated").into(),
+            Blob::from_content("hello world updated again").into(),
+        ];
+
+        let result = PackEncoder::try_as_offset_delta(entries, 0, false).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert!(result.iter().all(|(encoded, _)| !encoded.is_empty()));
     }
 
     #[tokio::test]
@@ -926,8 +963,9 @@ mod tests {
         assert!(matches!(err, GitError::PackEncodeError(_)));
     }
 
-    async fn get_entries_for_test() -> (Arc<Mutex<Vec<Entry>>>, PackFileGuard) {
-        let (source, dl_guard) = download_pack_file("encode-test-sha1.pack");
+    async fn get_entries_for_test() -> Arc<Mutex<Vec<Entry>>> {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/packs/encode-test-sha1.pack");
 
         let mut p = Pack::new(None, None, Some(PathBuf::from("/tmp/.cache_temp")), true);
 
@@ -949,10 +987,11 @@ mod tests {
         tracing::info!("total entries: {}", p.number);
         drop(p);
 
-        (entries, dl_guard)
+        entries
     }
-    async fn get_entries_for_test_sha256() -> (Arc<Mutex<Vec<Entry>>>, PackFileGuard) {
-        let (source, dl_guard) = download_pack_file("encode-test-sha256.pack");
+    async fn get_entries_for_test_sha256() -> Arc<Mutex<Vec<Entry>>> {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/packs/encode-test-sha256.pack");
 
         let mut p = Pack::new(None, None, Some(PathBuf::from("/tmp/.cache_temp")), true);
 
@@ -974,7 +1013,7 @@ mod tests {
         tracing::info!("total entries: {}", p.number);
         drop(p);
 
-        (entries, dl_guard)
+        entries
     }
 
     #[tokio::test]
@@ -983,7 +1022,7 @@ mod tests {
         init_logger();
 
         let start = Instant::now();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1046,7 +1085,7 @@ mod tests {
 
         let start = Instant::now();
         // use sha256 pack file for testing
-        let (entries, _dl_guard) = get_entries_for_test_sha256().await;
+        let entries = get_entries_for_test_sha256().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1104,7 +1143,7 @@ mod tests {
     async fn test_pack_encoder_large_file() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1173,7 +1212,7 @@ mod tests {
     async fn test_pack_encoder_large_file_sha256() {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test_sha256().await;
+        let entries = get_entries_for_test_sha256().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1243,7 +1282,7 @@ mod tests {
     async fn test_pack_encoder_with_zstdelta() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1305,7 +1344,7 @@ mod tests {
     async fn test_pack_encoder_with_zstdelta_sha256() {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test_sha256().await;
+        let entries = get_entries_for_test_sha256().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1381,7 +1420,7 @@ mod tests {
     async fn test_pack_encoder_large_file_with_delta() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1444,7 +1483,7 @@ mod tests {
     async fn test_pack_encoder_large_file_with_delta_sha256() {
         let _guard = set_hash_kind_for_test(HashKind::Sha256);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test_sha256().await;
+        let entries = get_entries_for_test_sha256().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1508,7 +1547,7 @@ mod tests {
     async fn test_pack_encoder_output_to_files() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
@@ -1576,7 +1615,7 @@ mod tests {
     async fn test_pack_encoder_output_to_files_with_delta() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         init_logger();
-        let (entries, _dl_guard) = get_entries_for_test().await;
+        let entries = get_entries_for_test().await;
         let entries_number = entries.lock().await.len();
 
         let total_original_size: usize = entries
